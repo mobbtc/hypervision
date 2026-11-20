@@ -1,26 +1,26 @@
 # Hypervision
 
-Base dettect com integração experimental de verificações selecionadas do Echo Jean.
+Base dettect com integraÃ§Ã£o experimental de verificaÃ§Ãµes selecionadas do Echo Jean.
 
-- [Código e notas de integração](dettect/INTEGRACAO.txt)
-- [Componentes novos](dettect/detections/echo_integration/)
-- [Testes](dettect/tests/)
-- [Inventário de alterações](dettect/docs/alteracoes.json)
+- [CÃ³digo e notas de integraÃ§Ã£o](INTEGRACAO.txt)
+- [Componentes novos](echo_integration/)
+- [Testes](tests/)
+- [InventÃ¡rio de alteraÃ§Ãµes](docs/alteracoes.json)
 - [Pacote ZIP](output/dettect-echo-integrado.zip)
 
 ## Estado
 
-Esta é uma integração experimental de código-fonte. Ainda existem pendências do relatório, documentadas em `dettect/INTEGRACAO.txt`. O material original contém apenas `detections/`: faltam a solução principal, `pch.h`, `utils/`, `scan_api/` e outras dependências. Não existe um executável completo validado.
+Esta Ã© uma integraÃ§Ã£o experimental de cÃ³digo-fonte. Ainda existem pendÃªncias do relatÃ³rio, documentadas em `INTEGRACAO.txt`. O material original contÃ©m apenas `detections/`: faltam a soluÃ§Ã£o principal, `pch.h`, `utils/`, `scan_api/` e outras dependÃªncias. NÃ£o existe um executÃ¡vel completo validado.
 
-Os componentes novos passaram os testes C++17/MSVC e seis testes YARA com fixtures sintéticas. O scanner completo não foi executado.
+Os componentes novos passaram os testes C++17/MSVC e seis testes YARA com fixtures sintÃ©ticas. O scanner completo nÃ£o foi executado.
 
 ## Testes
 
-No Windows, executar `dettect\tests\run-tests.cmd` (ajustar o caminho do Visual Studio, se necessário).
+No Windows, executar `tests\run-tests.cmd` (ajustar o caminho do Visual Studio, se necessÃ¡rio).
 
 ```powershell
 python -m pip install yara-python
-python dettect/tests/test_yara.py
+python tests/test_yara.py
 ```
 
-Os novos resultados ficam localmente em `%LOCALAPPDATA%\dettect\echo-integration\latest.json`. Isto não desativa a comunicação de rede do código legado.
+Os novos resultados ficam localmente em `%LOCALAPPDATA%\dettect\echo-integration\latest.json`. Isto nÃ£o desativa a comunicaÃ§Ã£o de rede do cÃ³digo legado.
