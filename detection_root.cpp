@@ -434,7 +434,7 @@ void c_detection::start_scan ( )
         for (auto& future : futures) future.get();
         echo_integration::correlate();
         if (!echo_integration::write_local_results())
-            LOG(INFO, "N/A") << "Echo integration: local result write failed";
+            LOG(INFO, "N/A") << "Hypervision: local result write failed";
         integrity_heartbeat::instance ( ).stop ( );
 
         {
