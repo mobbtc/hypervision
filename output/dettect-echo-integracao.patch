@@ -1,0 +1,806 @@
+--- a/detections/atlas_trace/atlas/check_memory.cpp
++++ b/detections/atlas_trace/atlas/check_memory.cpp
+@@ -1,4 +1,5 @@
+ #include "checks.h"
++#include "../../echo_integration/core.h"
+ #include "pe.h"
+ #include "trust.h"
+ 
+@@ -278,6 +279,8 @@
+         s.size = res.totalSize;
+         s.executable = true;
+         s.isPeImage = probe.isPe;
++        if (readOk) echo_integration::memory_context(head,
++            "pid:"+std::to_string(t.pid())+":region:"+std::to_string(res.base),static_cast<std::int64_t>(std::time(nullptr)),probe.isPe);
+ 
+         if (probe.isPe) {
+             Finding f;
+@@ -318,6 +321,8 @@
+                 const Region& q = *res.parts[i];
+                 if (!q.Executable() || q.state != MEM_COMMIT || q.Writable()) continue;
+                 if (t.ReadRegion(q, body, 8u << 20)) {
++                    echo_integration::memory_context(body,
++                        "pid:"+std::to_string(t.pid())+":region:"+std::to_string(res.base),static_cast<std::int64_t>(std::time(nullptr)),probe.isPe);
+                     PeContentProbe pc = ProbePeContent(body);
+                     if (pc.dllNames + pc.apiNames > probe2.dllNames + probe2.apiNames) probe2 = pc;
+                 }
+--- a/detections/client_checks/yara_scanner/c_yara_scanner.cpp
++++ b/detections/client_checks/yara_scanner/c_yara_scanner.cpp
+@@ -1,6 +1,8 @@
+ #include "c_yara_scanner.h"
+ #include "rule_delivery.h"
+ #include "yara_compile_util.h"
++#include "../../echo_integration/windows_support.h"
++#include "../../echo_integration/yara_rules.h"
+ #include "../../../utils/sig_cache.h"
+ 
+ std::atomic<uint64_t>                 YaraScanner::s_filesScanned{ 0 };
+@@ -312,7 +314,7 @@
+     {
+         const wchar_t* dot = wcsrchr(filename, L'.');
+         if (!dot || !dot[1]) return false;
+-        return _wcsicmp(dot, xorstr_(L".exe")) == 0 || _wcsicmp(dot, xorstr_(L".dll")) == 0 ||
++        return (echo_integration::enabled("yara") && _wcsicmp(dot, L".dmp") == 0) || _wcsicmp(dot, xorstr_(L".exe")) == 0 || _wcsicmp(dot, xorstr_(L".dll")) == 0 ||
+             _wcsicmp(dot, xorstr_(L".mui")) == 0 || _wcsicmp(dot, xorstr_(L".sys")) == 0 ||
+             _wcsicmp(dot, xorstr_(L".scr")) == 0 || _wcsicmp(dot, xorstr_(L".mp3")) == 0 ||
+             _wcsicmp(dot, xorstr_(L".mp4")) == 0 || _wcsicmp(dot, xorstr_(L".ogg")) == 0 ||
+@@ -717,6 +719,8 @@
+     return result;
+ }
+ 
++static std::atomic<std::size_t> echo_dump_count{0};
++
+ struct ScanCallbackCtx
+ {
+     const wchar_t*  path;
+@@ -740,6 +744,34 @@
+             auto* rule = static_cast<YR_RULE*>(message_data);
+             auto* ctx  = static_cast<ScanCallbackCtx*>(user_data);
+ 
++            const std::string echo_rule(rule->identifier);
++            if (echo_rule.rfind("ECHO_",0)==0) {
++                if (!echo_integration::enabled("yara")) return CALLBACK_CONTINUE;
++                const auto path=echo_integration::utf8(ctx->path);
++                const bool dump=echo_rule.rfind("ECHO_DUMP_",0)==0;
++                if (dump && echo_integration::extension(path)!=".dmp") return CALLBACK_CONTINUE;
++                WIN32_FILE_ATTRIBUTE_DATA attrs{};
++                std::int64_t timestamp=GetFileAttributesExW(ctx->path,GetFileExInfoStandard,&attrs)?echo_integration::file_epoch(attrs.ftLastWriteTime):0;
++                echo_integration::DumpContext dump_meta;
++                if (dump) {
++                    dump_meta=echo_integration::dump_context(ctx->data,ctx->dataLen);
++                    if(!dump_meta.valid) return CALLBACK_CONTINUE;
++                    timestamp=dump_meta.timestamp;
++                }
++                auto f=echo_integration::observation(echo_rule,"yara",dump?"crash_dump":"file",path,timestamp,"yara",
++                    "Legitimate software, source samples, overlays, Intel driver packages and historical dump content; no execution inferred.");
++                f.evidence={"rule="+echo_rule,"bytes="+std::to_string(ctx->dataLen)};
++                f.evidence.push_back("sha256="+ComputeSHA256(ctx->data,ctx->dataLen));
++                if(dump) {
++                    f.evidence.push_back("timestamp=minidump_header");
++                    if(!dump_meta.process_path.empty()) f.evidence.push_back("process_path_sha256="+ComputeSHA256(dump_meta.process_path.data(),dump_meta.process_path.size()));
++                    else f.evidence.push_back("process_identity=unavailable");
++                }
++                echo_integration::submit(std::move(f));
++                return CALLBACK_CONTINUE; // Never increment legacy detections for context rules.
++            }
++            // Newly included dumps must not acquire verdicts from unrelated legacy file rules.
++            if (echo_integration::extension(echo_integration::utf8(ctx->path))==".dmp") return CALLBACK_CONTINUE;
+             if (IsWhitelistedFileName(ctx->path))
+                 return CALLBACK_CONTINUE;
+ 
+@@ -872,6 +904,11 @@
+         {
+             try
+             {
++                if (echo_integration::extension(echo_integration::utf8(entry.path))==".dmp" &&
++                    (!echo_integration::enabled("yara") || entry.size>echo_integration::policy.max_file_bytes ||
++                     echo_dump_count.fetch_add(1)>=echo_integration::policy.max_files)) {
++                    s_filesSkipped++; continue;
++                }
+                 HANDLE hFile = CreateFileW(
+                     entry.path.c_str(), GENERIC_READ,
+                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+@@ -988,13 +1025,14 @@
+     try
+     {
+         ResetState();
++        echo_dump_count=0;
+ 
+         if (yr_initialize() != ERROR_SUCCESS)
+             return {};
+ 
+         RuleDelivery::FetchResult delivery = RuleDelivery::FetchRules(detect.pin);
+ 
+-        if (!delivery.ok || delivery.rulesLength == 0)
++        if ((!delivery.ok || delivery.rulesLength == 0) && !echo_integration::enabled("yara"))
+         {
+             yr_finalize();
+             return {};
+@@ -1006,9 +1044,11 @@
+ 
+         YR_RULES* rules = nullptr;
+         {
+-            std::string source(reinterpret_cast<const char*>(delivery.plaintext.data()),
+-                               delivery.rulesLength);
++            std::string source;
++            if(delivery.ok && delivery.rulesLength)
++                source.assign(reinterpret_cast<const char*>(delivery.plaintext.data()),delivery.rulesLength);
+             s_ruleNames = RuleDelivery::ParseNameTable(source.data(), source.size());
++            if (echo_integration::enabled("yara")) source += echo_integration::yara_source;
+             rules = YaraCompile::CompileAll(source, scanEpoch);
+             CrashShield::SecureWipe(&source[0], source.size());
+         }
+--- a/detections/detection_root.cpp
++++ b/detections/detection_root.cpp
+@@ -1,4 +1,5 @@
+ #include "detection_root.h"
++#include "echo_integration/runtime.h"
+ #include <thread>
+ #include <future>
+ #include <vector>
+@@ -136,6 +137,9 @@
+ 
+ void c_detection::start_scan ( )
+ {
++    echo_integration::reset();
++    echo_integration::metrics.clear();
++    echo_integration::inventory.clear();
+     CryptoInit::EnsureInitialized ( );
+ 
+     detect.scan_started = true;
+@@ -186,6 +190,15 @@
+     utils->check_server_status ( );
+ 
+     std::atomic<size_t> completed_tasks { 0 };
++    std::vector<echo_integration::Module> modules;
++    auto register_module = [&](const char* id, const char* category, const char* sources,
++                               std::function<void()> run) {
++        echo_integration::Module m;
++        m.id=id; m.category=category; m.sources=sources; m.run=std::move(run);
++        // Legacy metadata remains explicitly unknown until its implementation is audited.
++        if (!echo_integration::policy.disabled.count(id)) modules.push_back(std::move(m));
++    };
++
+ 
+     if ( detect.server_online && !detect.scanned )
+     {
+@@ -198,219 +211,208 @@
+             return;
+         }
+ 
+-    #ifdef DETECT_MINECRAFT
+-        detect.i_total_stages = 81;
+-    #elif DETECT_FIVEM
+-        detect.i_total_stages = 78;
+-    #elif DETECT_ROBLOX
+-        detect.i_total_stages = 75;
+-    #elif DETECT_FORTNITE
+-        detect.i_total_stages = 51;
+-    #elif DETECT_FREEFIRE
+-        detect.i_total_stages = 73;
+-    #elif DETECT_DAYZ
+-        detect.i_total_stages = 71;
+-    #elif DETECT_SIEGE
+-        detect.i_total_stages = 72;
+-    #elif DETECT_RUST
+-        detect.i_total_stages = 72;
+-    #elif DETECT_COD
+-        detect.i_total_stages = 72;
+-    #elif DETECT_CS
+-        detect.i_total_stages = 72;
+-    #endif
+     
+ #ifndef DETECT_FORTNITE
+ 
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_usn_journal_size->start_usn_journal_size_detection(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_powershell_commands_ran->start_powershell_evtx_commands(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_diffd->start_diff_drive_detection(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_club->start_club44_check(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_asar->asar_checks(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_wmi->start_wmi(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_task2->start_taskschedule_checks(); utils->increment_progress(); ++completed_tasks; }));
+-
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_sus_threads->start_suspeced_threads_detection(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_cleared_evt->start_cleared_eventlog(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_bam->start_bam_state_detection(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_mod_check->start_modified_check(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_injdll->start_opensavemidlmru_scan(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_res_ser->start_restarted_services_check(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_term_ser->StartTerminationCheck(); utils->increment_progress(); ++completed_tasks; }));
+-
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_usnjrnl2->start_usn_modified2(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_time->start_timechange(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_dllh->start_dllh_scan(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_peinj->start_pe_scan(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_peinj2->start_pe_injection_2_scan(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_h_and_p->start_hosts_and_prefetch(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_powershell_logsize->start_powershell_logsize_check(); utils->increment_progress(); ++completed_tasks; }));
+-
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_powershell_profiles->checkProfiles(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_regscan->start_Regsitry_scan(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_prefbp->start_prefetch_bypass_check(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_prefint->start_prefetch_integrity(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_evt_byp->start_eventlog_bypass(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_cpl->CheckCPLBypass(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_msi->CheckMSIBypass(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_reg->CheckREGBypass(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_inf->CheckINFBypass(); utils->increment_progress(); ++completed_tasks; }));
++        register_module("c_usn_journal_size.start_usn_journal_size_detection", "legacy", "unknown", [this] { c_usn_journal_size->start_usn_journal_size_detection(); });
++        register_module("c_powershell_commands_ran.start_powershell_evtx_commands", "powershell", "windows_event_log", [this] { c_powershell_commands_ran->start_powershell_evtx_commands(); });
++        register_module("c_diffd.start_diff_drive_detection", "legacy", "unknown", [this] { c_diffd->start_diff_drive_detection(); });
++        register_module("c_club.start_club44_check", "legacy", "unknown", [this] { c_club->start_club44_check(); });
++        register_module("c_asar.asar_checks", "legacy", "unknown", [this] { c_asar->asar_checks(); });
++        register_module("c_wmi.start_wmi", "legacy", "unknown", [this] { c_wmi->start_wmi(); });
++        register_module("c_task2.start_taskschedule_checks", "legacy", "unknown", [this] { c_task2->start_taskschedule_checks(); });
++
++        register_module("c_sus_threads.start_suspeced_threads_detection", "legacy", "unknown", [this] { c_sus_threads->start_suspeced_threads_detection(); });
++        register_module("c_cleared_evt.start_cleared_eventlog", "legacy", "unknown", [this] { c_cleared_evt->start_cleared_eventlog(); });
++        register_module("c_bam.start_bam_state_detection", "legacy", "unknown", [this] { c_bam->start_bam_state_detection(); });
++        register_module("c_mod_check.start_modified_check", "legacy", "unknown", [this] { c_mod_check->start_modified_check(); });
++        register_module("c_injdll.start_opensavemidlmru_scan", "legacy", "unknown", [this] { c_injdll->start_opensavemidlmru_scan(); });
++        register_module("c_res_ser.start_restarted_services_check", "legacy", "unknown", [this] { c_res_ser->start_restarted_services_check(); });
++        register_module("c_term_ser.StartTerminationCheck", "legacy", "unknown", [this] { c_term_ser->StartTerminationCheck(); });
++
++        register_module("c_usnjrnl2.start_usn_modified2", "legacy", "unknown", [this] { c_usnjrnl2->start_usn_modified2(); });
++        register_module("c_time.start_timechange", "legacy", "unknown", [this] { c_time->start_timechange(); });
++        register_module("c_dllh.start_dllh_scan", "legacy", "unknown", [this] { c_dllh->start_dllh_scan(); });
++        register_module("c_peinj.start_pe_scan", "legacy", "unknown", [this] { c_peinj->start_pe_scan(); });
++        register_module("c_peinj2.start_pe_injection_2_scan", "legacy", "unknown", [this] { c_peinj2->start_pe_injection_2_scan(); });
++        register_module("c_h_and_p.start_hosts_and_prefetch", "legacy", "unknown", [this] { c_h_and_p->start_hosts_and_prefetch(); });
++        register_module("c_powershell_logsize.start_powershell_logsize_check", "legacy", "unknown", [this] { c_powershell_logsize->start_powershell_logsize_check(); });
++
++        register_module("c_powershell_profiles.checkProfiles", "legacy", "unknown", [this] { c_powershell_profiles->checkProfiles(); });
++        register_module("c_regscan.start_Regsitry_scan", "legacy", "unknown", [this] { c_regscan->start_Regsitry_scan(); });
++        register_module("c_prefbp.start_prefetch_bypass_check", "legacy", "unknown", [this] { c_prefbp->start_prefetch_bypass_check(); });
++        register_module("c_prefint.start_prefetch_integrity", "legacy", "unknown", [this] { c_prefint->start_prefetch_integrity(); });
++        register_module("c_evt_byp.start_eventlog_bypass", "legacy", "unknown", [this] { c_evt_byp->start_eventlog_bypass(); });
++        register_module("c_cpl.CheckCPLBypass", "legacy", "unknown", [this] { c_cpl->CheckCPLBypass(); });
++        register_module("c_msi.CheckMSIBypass", "legacy", "unknown", [this] { c_msi->CheckMSIBypass(); });
++        register_module("c_reg.CheckREGBypass", "legacy", "unknown", [this] { c_reg->CheckREGBypass(); });
++        register_module("c_inf.CheckINFBypass", "legacy", "unknown", [this] { c_inf->CheckINFBypass(); });
+          
+     #endif
+ 
+     #ifdef DETECT_MINECRAFT
+ 
+-        futures.emplace_back ( pool.enqueue ( [this, &completed_tasks] { c_atlas->start_atlas_trace_scan ( ); utils->increment_progress(); ++completed_tasks; } ) );
++        register_module("c_atlas.start_atlas_trace_scan", "memory", "process_memory,modules,threads", [this] { c_atlas->start_atlas_trace_scan(); });
+ 
+     #endif
+ 
+     #if defined(DETECT_MINECRAFT) || defined(DETECT_FIVEM)
+ 
+-        futures.emplace_back ( pool.enqueue ( [this, &completed_tasks] { c_fat32_2->start_fat32_2_modification_check ( ); utils->increment_progress(); ++completed_tasks; } ) );
+-        futures.emplace_back ( pool.enqueue ( [this, &completed_tasks] { c_fat32->start_fat32_modification_check ( ); utils->increment_progress(); ++completed_tasks; } ) );
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_junc->start_junc_scan(); utils->increment_progress(); ++completed_tasks; }));
+-
+-    #endif
+-
+-        futures.emplace_back ( pool.enqueue ( [this, &completed_tasks] { c_usn_journal_modified->start_usn_journal_modified_check ( ); utils->increment_progress(); ++completed_tasks; } ) );
+-        futures.emplace_back ( pool.enqueue ( [this, &completed_tasks] { c_executed_files->start_executed_file_checks ( ); utils->increment_progress(); ++completed_tasks; } ) );
+-        futures.emplace_back ( pool.enqueue ( [this, &completed_tasks] { c_device_rm->start_dev_rm_checks ( ); utils->increment_progress(); ++completed_tasks; } ) );
+-        futures.emplace_back ( pool.enqueue ( [this, &completed_tasks] { c_created_disk_part->start_created_part_checks ( ); utils->increment_progress(); ++completed_tasks; } ) );
+-        futures.emplace_back ( pool.enqueue ( [this, &completed_tasks] { c_deleted_disk_part->start_deleted_part_checks ( ); utils->increment_progress(); ++completed_tasks; } ) );
+-        futures.emplace_back ( pool.enqueue ( [this, &completed_tasks] { c_recycle_bin_modified->start_recycle_bin_modified_checks ( ); utils->increment_progress(); ++completed_tasks; } ) );
+-        futures.emplace_back ( pool.enqueue ( [this, &completed_tasks] { c_service->start_service_checks ( ); utils->increment_progress(); ++completed_tasks; } ) );
+-        futures.emplace_back ( pool.enqueue ( [this, &completed_tasks] { c_ahk->start_ahk_bypass_detections( ); utils->increment_progress(); ++completed_tasks; } ) );
+-        futures.emplace_back ( pool.enqueue ( [this, &completed_tasks] { c_prefcheck->start_enableprefetcherdeletion(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_letvol->start_letterless_volume_check(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_usbbypass->start_usb_bypass_check(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_usnbypasschecks->start_usn_bypass_checks(); utils->increment_progress(); ++completed_tasks; }));
+-
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_vpn->start_vpn_detection(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_install->print_install_date_and_elapsed_time(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_pc_start->start_pc_start_time_check(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_sy->start_systeminfo_scan(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_tone->term_onedrive(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_cb->start_cmd_and_bat_detection(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_py_ex->start_python_detection(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_vbs->start_vbs_detection(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_dma_pads->start_dma_pads(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_dma_protection->start_dma_protection(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_nvidia_patch->CheckNvidiaDriverPatch(); utils->increment_progress(); ++completed_tasks; }));
+-
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_browsers->start_browser_checks(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_bam_install->detect_bam_cleaned(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_cpowershell->start_powershell_scans(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_delbam->start_del_bam(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_delregkeys->start_deleted_reg_keys_check(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_cfg_check->start_cfg_check(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_discacc->ScanForDiscordUsernames(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_cdump->start_crashdump_checks(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_efidet->start_efi_detections(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_efi_mb->start_efi_measured_boot(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_prefdel->start_deleted_prefetch(); utils->increment_progress(); ++completed_tasks; }));
++        register_module("c_fat32_2.start_fat32_2_modification_check", "legacy", "unknown", [this] { c_fat32_2->start_fat32_2_modification_check(); });
++        register_module("c_fat32.start_fat32_modification_check", "legacy", "unknown", [this] { c_fat32->start_fat32_modification_check(); });
++        register_module("c_junc.start_junc_scan", "legacy", "unknown", [this] { c_junc->start_junc_scan(); });
++
++    #endif
++
++        register_module("c_usn_journal_modified.start_usn_journal_modified_check", "legacy", "unknown", [this] { c_usn_journal_modified->start_usn_journal_modified_check(); });
++        register_module("c_executed_files.start_executed_file_checks", "legacy", "unknown", [this] { c_executed_files->start_executed_file_checks(); });
++        register_module("c_device_rm.start_dev_rm_checks", "legacy", "unknown", [this] { c_device_rm->start_dev_rm_checks(); });
++        register_module("c_created_disk_part.start_created_part_checks", "legacy", "unknown", [this] { c_created_disk_part->start_created_part_checks(); });
++        register_module("c_deleted_disk_part.start_deleted_part_checks", "legacy", "unknown", [this] { c_deleted_disk_part->start_deleted_part_checks(); });
++        register_module("c_recycle_bin_modified.start_recycle_bin_modified_checks", "legacy", "unknown", [this] { c_recycle_bin_modified->start_recycle_bin_modified_checks(); });
++        register_module("c_service.start_service_checks", "drivers", "service_control_manager,code_integrity", [this] { c_service->start_service_checks(); });
++        register_module("c_ahk.start_ahk_bypass_detections", "legacy", "unknown", [this] { c_ahk->start_ahk_bypass_detections(); });
++        register_module("c_prefcheck.start_enableprefetcherdeletion", "legacy", "unknown", [this] { c_prefcheck->start_enableprefetcherdeletion(); });
++        register_module("c_letvol.start_letterless_volume_check", "legacy", "unknown", [this] { c_letvol->start_letterless_volume_check(); });
++        register_module("c_usbbypass.start_usb_bypass_check", "legacy", "unknown", [this] { c_usbbypass->start_usb_bypass_check(); });
++        register_module("c_usnbypasschecks.start_usn_bypass_checks", "legacy", "unknown", [this] { c_usnbypasschecks->start_usn_bypass_checks(); });
++
++        register_module("c_vpn.start_vpn_detection", "legacy", "unknown", [this] { c_vpn->start_vpn_detection(); });
++        register_module("c_install.print_install_date_and_elapsed_time", "legacy", "unknown", [this] { c_install->print_install_date_and_elapsed_time(); });
++        register_module("c_pc_start.start_pc_start_time_check", "legacy", "unknown", [this] { c_pc_start->start_pc_start_time_check(); });
++        register_module("c_sy.start_systeminfo_scan", "legacy", "unknown", [this] { c_sy->start_systeminfo_scan(); });
++        register_module("c_tone.term_onedrive", "legacy", "unknown", [this] { c_tone->term_onedrive(); });
++        register_module("c_cb.start_cmd_and_bat_detection", "legacy", "unknown", [this] { c_cb->start_cmd_and_bat_detection(); });
++        register_module("c_py_ex.start_python_detection", "legacy", "unknown", [this] { c_py_ex->start_python_detection(); });
++        register_module("c_vbs.start_vbs_detection", "legacy", "unknown", [this] { c_vbs->start_vbs_detection(); });
++        register_module("c_dma_pads.start_dma_pads", "legacy", "unknown", [this] { c_dma_pads->start_dma_pads(); });
++        register_module("c_dma_protection.start_dma_protection", "legacy", "unknown", [this] { c_dma_protection->start_dma_protection(); });
++        register_module("c_nvidia_patch.CheckNvidiaDriverPatch", "legacy", "unknown", [this] { c_nvidia_patch->CheckNvidiaDriverPatch(); });
++
++        register_module("c_browsers.start_browser_checks", "legacy", "unknown", [this] { c_browsers->start_browser_checks(); });
++        register_module("c_bam_install.detect_bam_cleaned", "legacy", "unknown", [this] { c_bam_install->detect_bam_cleaned(); });
++        register_module("c_cpowershell.start_powershell_scans", "legacy", "unknown", [this] { c_cpowershell->start_powershell_scans(); });
++        register_module("c_delbam.start_del_bam", "legacy", "unknown", [this] { c_delbam->start_del_bam(); });
++        register_module("c_delregkeys.start_deleted_reg_keys_check", "legacy", "unknown", [this] { c_delregkeys->start_deleted_reg_keys_check(); });
++        register_module("c_cfg_check.start_cfg_check", "legacy", "unknown", [this] { c_cfg_check->start_cfg_check(); });
++        register_module("c_discacc.ScanForDiscordUsernames", "legacy", "unknown", [this] { c_discacc->ScanForDiscordUsernames(); });
++        register_module("c_cdump.start_crashdump_checks", "legacy", "unknown", [this] { c_cdump->start_crashdump_checks(); });
++        register_module("c_efidet.start_efi_detections", "legacy", "unknown", [this] { c_efidet->start_efi_detections(); });
++        register_module("c_efi_mb.start_efi_measured_boot", "efi", "firmware,tpm,efi_partition", [this] { c_efi_mb->start_efi_measured_boot(); });
++        register_module("c_prefdel.start_deleted_prefetch", "legacy", "unknown", [this] { c_prefdel->start_deleted_prefetch(); });
+         
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_lsass->start_lsass_scan(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_pcasvc->start_pca_scan(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_usnjrnl_ex->start_scan_ex(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_evt_exp->start_eventlog_exploit_check(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_yara->start_yara_scan(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_prefinj->start_prefetch_injections(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_adminran->start_files_ran_with_admin(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_commands3->start_commands_3(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_ads->start_sus_ads(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_autoruns->start_autoruns_detection(); utils->increment_progress(); ++completed_tasks; }));
+-
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_dns->start_dns_scan(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_compilation->compilation_scan(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_usnjrnl->start_usn_scan(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_exe_pf->start_exe_pf_scan(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_explorer_strings->start_explorer_scan(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_amc->start_amcache_scan(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_ss->start_ss_detection(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_dbu->start_windb_urls(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_windef->QueryDefenderHistory(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_vhd->start_vhd_detection(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_luascripts->start_luascripts_scan(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_commands2->start_commands2(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_anydesk->start_anydesk_scan(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_saved->start_saved_files(); utils->increment_progress(); ++completed_tasks; }));
+-
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_cdps->start_dps_scan(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_cdiag->start_diag_scan(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_csys->start_sysmain_scan(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_csgrm->start_sgrm_scan(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_sgrm2->start_sgrm2_scan(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_cschedule->start_schedule_scan(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_capp->start_appinfo_scan(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_mps->start_mps_scan(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_cmsmpeng->start_mpssvc_scan(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_ccrypt->start_cryptsvc_scan(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_cdusm->start_dusm_scan(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_clogi->start_clogitech_scan(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_discord->start_discord_scan(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_chrome->start_chrome_scan(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_edge->start_edge_scan(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_brave->start_brave_scan(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_opera->start_opera_scan(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_vivaldi->start_vivaldi_scan(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_firefox->start_firefox_scan(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_cfivem->start_cfivem_scan(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_cevt->start_evt_scan(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_ctask->start_task_scan(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_csi->start_si_scan(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_crtb->start_runtimebroker_scan(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_camcache->ProcessAmcache(); utils->increment_progress(); ++completed_tasks; }));
++        register_module("c_lsass.start_lsass_scan", "legacy", "unknown", [this] { c_lsass->start_lsass_scan(); });
++        register_module("c_pcasvc.start_pca_scan", "legacy", "unknown", [this] { c_pcasvc->start_pca_scan(); });
++        register_module("c_usnjrnl_ex.start_scan_ex", "legacy", "unknown", [this] { c_usnjrnl_ex->start_scan_ex(); });
++        register_module("c_evt_exp.start_eventlog_exploit_check", "legacy", "unknown", [this] { c_evt_exp->start_eventlog_exploit_check(); });
++        register_module("c_yara.start_yara_scan", "yara", "files,crash_dumps", [this] { c_yara->start_yara_scan(); });
++        register_module("c_prefinj.start_prefetch_injections", "legacy", "unknown", [this] { c_prefinj->start_prefetch_injections(); });
++        register_module("c_adminran.start_files_ran_with_admin", "legacy", "unknown", [this] { c_adminran->start_files_ran_with_admin(); });
++        register_module("c_commands3.start_commands_3", "legacy", "unknown", [this] { c_commands3->start_commands_3(); });
++        register_module("c_ads.start_sus_ads", "legacy", "unknown", [this] { c_ads->start_sus_ads(); });
++        register_module("c_autoruns.start_autoruns_detection", "legacy", "unknown", [this] { c_autoruns->start_autoruns_detection(); });
++
++        register_module("c_dns.start_dns_scan", "legacy", "unknown", [this] { c_dns->start_dns_scan(); });
++        register_module("c_compilation.compilation_scan", "legacy", "unknown", [this] { c_compilation->compilation_scan(); });
++        register_module("c_usnjrnl.start_usn_scan", "usn", "usn_journal", [this] { c_usnjrnl->start_usn_scan(); });
++        register_module("c_exe_pf.start_exe_pf_scan", "legacy", "unknown", [this] { c_exe_pf->start_exe_pf_scan(); });
++        register_module("c_explorer_strings.start_explorer_scan", "legacy", "unknown", [this] { c_explorer_strings->start_explorer_scan(); });
++        register_module("c_amc.start_amcache_scan", "legacy", "unknown", [this] { c_amc->start_amcache_scan(); });
++        register_module("c_ss.start_ss_detection", "legacy", "unknown", [this] { c_ss->start_ss_detection(); });
++        register_module("c_dbu.start_windb_urls", "legacy", "unknown", [this] { c_dbu->start_windb_urls(); });
++        register_module("c_windef.QueryDefenderHistory", "defender", "defender_events,mplog", [this] { c_windef->QueryDefenderHistory(); });
++        register_module("c_vhd.start_vhd_detection", "legacy", "unknown", [this] { c_vhd->start_vhd_detection(); });
++        register_module("c_luascripts.start_luascripts_scan", "legacy", "unknown", [this] { c_luascripts->start_luascripts_scan(); });
++        register_module("c_commands2.start_commands2", "legacy", "unknown", [this] { c_commands2->start_commands2(); });
++        register_module("c_anydesk.start_anydesk_scan", "legacy", "unknown", [this] { c_anydesk->start_anydesk_scan(); });
++        register_module("c_saved.start_saved_files", "lnk", "shell_links,opensave_mru", [this] { c_saved->start_saved_files(); });
++
++        register_module("c_cdps.start_dps_scan", "legacy", "unknown", [this] { c_cdps->start_dps_scan(); });
++        register_module("c_cdiag.start_diag_scan", "legacy", "unknown", [this] { c_cdiag->start_diag_scan(); });
++        register_module("c_csys.start_sysmain_scan", "legacy", "unknown", [this] { c_csys->start_sysmain_scan(); });
++        register_module("c_csgrm.start_sgrm_scan", "legacy", "unknown", [this] { c_csgrm->start_sgrm_scan(); });
++        register_module("c_sgrm2.start_sgrm2_scan", "legacy", "unknown", [this] { c_sgrm2->start_sgrm2_scan(); });
++        register_module("c_cschedule.start_schedule_scan", "legacy", "unknown", [this] { c_cschedule->start_schedule_scan(); });
++        register_module("c_capp.start_appinfo_scan", "legacy", "unknown", [this] { c_capp->start_appinfo_scan(); });
++        register_module("c_mps.start_mps_scan", "legacy", "unknown", [this] { c_mps->start_mps_scan(); });
++        register_module("c_cmsmpeng.start_mpssvc_scan", "legacy", "unknown", [this] { c_cmsmpeng->start_mpssvc_scan(); });
++        register_module("c_ccrypt.start_cryptsvc_scan", "legacy", "unknown", [this] { c_ccrypt->start_cryptsvc_scan(); });
++        register_module("c_cdusm.start_dusm_scan", "legacy", "unknown", [this] { c_cdusm->start_dusm_scan(); });
++        register_module("c_clogi.start_clogitech_scan", "legacy", "unknown", [this] { c_clogi->start_clogitech_scan(); });
++        register_module("c_discord.start_discord_scan", "legacy", "unknown", [this] { c_discord->start_discord_scan(); });
++        register_module("c_chrome.start_chrome_scan", "legacy", "unknown", [this] { c_chrome->start_chrome_scan(); });
++        register_module("c_edge.start_edge_scan", "legacy", "unknown", [this] { c_edge->start_edge_scan(); });
++        register_module("c_brave.start_brave_scan", "legacy", "unknown", [this] { c_brave->start_brave_scan(); });
++        register_module("c_opera.start_opera_scan", "legacy", "unknown", [this] { c_opera->start_opera_scan(); });
++        register_module("c_vivaldi.start_vivaldi_scan", "legacy", "unknown", [this] { c_vivaldi->start_vivaldi_scan(); });
++        register_module("c_firefox.start_firefox_scan", "legacy", "unknown", [this] { c_firefox->start_firefox_scan(); });
++        register_module("c_cfivem.start_cfivem_scan", "legacy", "unknown", [this] { c_cfivem->start_cfivem_scan(); });
++        register_module("c_cevt.start_evt_scan", "legacy", "unknown", [this] { c_cevt->start_evt_scan(); });
++        register_module("c_ctask.start_task_scan", "legacy", "unknown", [this] { c_ctask->start_task_scan(); });
++        register_module("c_csi.start_si_scan", "legacy", "unknown", [this] { c_csi->start_si_scan(); });
++        register_module("c_crtb.start_runtimebroker_scan", "legacy", "unknown", [this] { c_crtb->start_runtimebroker_scan(); });
++        register_module("c_camcache.ProcessAmcache", "legacy", "unknown", [this] { c_camcache->ProcessAmcache(); });
+ 
+ #ifdef DETECT_MINECRAFT
+ 
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_cjavaw->start_cjavaw_scan(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_winmg->start_winmg_scan(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_jvmarg->start_jvm_arg_scan(); utils->increment_progress(); ++completed_tasks; }));
+-        futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_javainj->start_java_injection_scan(); utils->increment_progress(); ++completed_tasks; }));
++        register_module("c_cjavaw.start_cjavaw_scan", "legacy", "unknown", [this] { c_cjavaw->start_cjavaw_scan(); });
++        register_module("c_winmg.start_winmg_scan", "legacy", "unknown", [this] { c_winmg->start_winmg_scan(); });
++        register_module("c_jvmarg.start_jvm_arg_scan", "legacy", "unknown", [this] { c_jvmarg->start_jvm_arg_scan(); });
++        register_module("c_javainj.start_java_injection_scan", "legacy", "unknown", [this] { c_javainj->start_java_injection_scan(); });
+ #endif
+ 
+     #if defined(DETECT_FORTNITE) || defined(DETECT_FIVEM) || defined(DETECT_SIEGE) || defined(DETECT_FREEFIRE)
+ 
+-            futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_fusers->start_hdmifuser_scan(); utils->increment_progress(); ++completed_tasks; }));
+-            futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_ddc->start_ddc_scan(); utils->increment_progress(); ++completed_tasks; }));
+-            futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_dma->start_pci_scanning(); utils->increment_progress(); ++completed_tasks; }));
++            register_module("c_fusers.start_hdmifuser_scan", "legacy", "unknown", [this] { c_fusers->start_hdmifuser_scan(); });
++            register_module("c_ddc.start_ddc_scan", "legacy", "unknown", [this] { c_ddc->start_ddc_scan(); });
++            register_module("c_dma.start_pci_scanning", "legacy", "unknown", [this] { c_dma->start_pci_scanning(); });
+ 
+     #endif
+ 
+     #ifdef DETECT_SIEGE
+ 
+-            futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_r6alts->start_r6alt_scan(); utils->increment_progress(); ++completed_tasks; }));
++            register_module("c_r6alts.start_r6alt_scan", "legacy", "unknown", [this] { c_r6alts->start_r6alt_scan(); });
+ 
+     #endif
+ 
+     #ifdef DETECT_FORTNITE
+ 
+-            futures.emplace_back(pool.enqueue([this, &completed_tasks] { c_epicalts->start_epic_alt_scan(); utils->increment_progress(); ++completed_tasks; }));
++            register_module("c_epicalts.start_epic_alt_scan", "legacy", "unknown", [this] { c_epicalts->start_epic_alt_scan(); });
+ 
+     #endif
+ 
+     #ifdef DETECT_RUST
+ 
+-            futures.emplace_back ( pool.enqueue ( [this, &completed_tasks] { c_steam_alt->start_steam_alt_detection ( ); utils->increment_progress(); ++completed_tasks;  } ) );
++            register_module("c_steam_alt.start_steam_alt_detection", "legacy", "unknown", [this] { c_steam_alt->start_steam_alt_detection(); });
+ 
+     #endif
+ 
+     #ifdef DETECT_MINECRAFT
+ 
+-            futures.emplace_back ( pool.enqueue ( [this, &completed_tasks] { c_game_instance->start_game_instance_detection ( ); utils->increment_progress(); ++completed_tasks; } ) );
+-            futures.emplace_back ( pool.enqueue ( [this, &completed_tasks] { c_mc_alts->start_mc_alts ( ); utils->increment_progress(); ++completed_tasks; } ) );
++            register_module("c_game_instance.start_game_instance_detection", "legacy", "unknown", [this] { c_game_instance->start_game_instance_detection(); });
++            register_module("c_mc_alts.start_mc_alts", "legacy", "unknown", [this] { c_mc_alts->start_mc_alts(); });
+ 
+     #elif defined(DETECT_FIVEM) || defined(DETECT_SIEGE) || defined(DETECT_DAYZ) || defined(DETECT_CS)
+ 
+-            futures.emplace_back ( pool.enqueue ( [this, &completed_tasks] { c_steam_alt->start_steam_alt_detection ( ); utils->increment_progress(); ++completed_tasks;  } ) );
+-            futures.emplace_back ( pool.enqueue ( [this, &completed_tasks] { c_ai->scan_ai ( ); utils->increment_progress(); ++completed_tasks; } ) );
++            register_module("c_steam_alt.start_steam_alt_detection", "legacy", "unknown", [this] { c_steam_alt->start_steam_alt_detection(); });
++            register_module("c_ai.scan_ai", "legacy", "unknown", [this] { c_ai->scan_ai(); });
+ 
+     #elif DETECT_ROBLOX
+ 
+-            futures.emplace_back ( pool.enqueue ( [this, &completed_tasks] { c_rblx->start_croblox_scan( ); utils->increment_progress(); ++completed_tasks;  } ) ); 
+-
+-    #endif
+-
++            register_module("c_rblx.start_croblox_scan", "legacy", "unknown", [this] { c_rblx->start_croblox_scan(); }); 
++
++    #endif
++
++        detect.i_total_stages = static_cast<int>(modules.size());
++        echo_integration::inventory = modules;
++        for (const auto& module : modules) {
++            futures.emplace_back(pool.enqueue([module, &completed_tasks] {
++                echo_integration::run_module(module);
++                // Always finish the task, including a module exception.
++                try { utils->increment_progress(); } catch (...) {}
++                ++completed_tasks;
++            }));
++        }
+         size_t total_futures = futures.size ( );
+         size_t stages = 12;
+ 
+@@ -429,6 +431,10 @@
+             if ( scan_api ) scan_api->update_stage ( static_cast< int >( stage ) , msg );
+         }
+ 
++        for (auto& future : futures) future.get();
++        echo_integration::correlate();
++        if (!echo_integration::write_local_results())
++            LOG(INFO, "N/A") << "Echo integration: local result write failed";
+         integrity_heartbeat::instance ( ).stop ( );
+ 
+         {
+--- a/detections/efi_detections/c_efi_measured_boot.cpp
++++ b/detections/efi_detections/c_efi_measured_boot.cpp
+@@ -1,4 +1,5 @@
+ #include "c_efi_measured_boot.h"
++#include "../echo_integration/efi_context.h"
+ #include "../../utils/fresh_install.h"
+ 
+ #include <bcrypt.h>
+@@ -1060,6 +1061,31 @@
+ 
+         st.esps = FindWindowsEsps();
+         st.tpm  = VerifyCurrentBoot(st.dir);
++        echo_integration::efi_context(st.tpm.tbsLogEventsParsed, st.tpm.tbsLogAvailable);
++        // Only live TBS image-load events are accepted as current-boot evidence.
++        if (echo_integration::enabled("efi")) for (const auto& ev : st.tpm.tbsLogEventsParsed) {
++            if (!IsImageLoadType(ev.type)) continue;
++            auto image = DecodeImageLoad(ev.data);
++            if (!image || !image->filePath || st.esps.empty()) continue;
++            auto disk = InspectFile(st.esps, *image->filePath, image->lengthInMemory);
++            if (disk.status == DiskCheck::Found && disk.authenticode) {
++                for (const auto& digest : ev.digests) {
++                    if (digest.alg != 0x000b || digest.bytes.size() != disk.authenticode->size()) continue;
++                    if (std::equal(digest.bytes.begin(),digest.bytes.end(),disk.authenticode->begin())) continue;
++                    auto mismatch=echo_integration::observation("ECHO.EFI.IMAGE_DIGEST_MISMATCH","efi","efi_image",*image->filePath,0,"tpm_measured_boot",
++                        "Image updates after boot, alternate ESP selection and firmware hashing differences; requires review.");
++                    mismatch.sources.insert("efi_partition");
++                    mismatch.evidence={"algorithm=sha256","measured_digest_differs_from_disk_authenticode"};
++                    echo_integration::submit(std::move(mismatch));
++                }
++            }
++            if (disk.status != DiskCheck::FileMissing) continue;
++            auto f = echo_integration::observation("ECHO.EFI.MEASURED_IMAGE_MISSING", "efi", "efi_image",
++                *image->filePath, 0, "tpm_measured_boot", "Boot updates, recovery and alternate ESPs can change files after boot.");
++            f.sources.insert("efi_partition");
++            f.evidence={"current_tbs_image_path_not_found_on_inspected_esp"};
++            echo_integration::submit(std::move(f));
++        }
+         const bool tbsHandlesCurrentUsb = st.tpm.tbsLogAvailable;
+ 
+         for (const auto& p : st.files) {
+--- a/detections/powershell_detections/powershell_commands_ran_detection/c_powershell_commands_ran_detection.cpp
++++ b/detections/powershell_detections/powershell_commands_ran_detection/c_powershell_commands_ran_detection.cpp
+@@ -1,4 +1,5 @@
+ #include "c_powershell_commands_ran_detection.h"
++#include "../../echo_integration/windows_support.h"
+ #include "../powershell_whitelist.h"
+ 
+ std::string c_powershell_commands_ran_detection::ExtractEventTime(const std::string& xml)
+@@ -216,6 +217,10 @@
+ 
+ void c_powershell_commands_ran_detection::start_powershell_evtx_commands()
+ {
++    try { echo_integration::powershell_context(); } catch (...) {
++        auto f=echo_integration::observation("ECHO.COLLECTOR.ERROR","coverage","collector","detections/powershell_detections/powershell_commands_ran_detection/c_powershell_commands_ran_detection.cpp",0,"collector","Collection failed; not a detection.");
++        echo_integration::submit(std::move(f));
++    }
+     try{
+     c_powershell_commands_ran_detection::Scan(
+         xorstr_(L"C:\\Windows\\System32\\winevt\\Logs\\Windows PowerShell.evtx")
+--- a/detections/saved_files/c_saved_files.cpp
++++ b/detections/saved_files/c_saved_files.cpp
+@@ -1,4 +1,5 @@
+ #include "c_saved_files.h"
++#include "../echo_integration/native_artifacts.h"
+ 
+ bool SavedFiles::IsPEExtension(const std::wstring& path)
+ {
+@@ -288,6 +289,10 @@
+ 
+ void SavedFiles::start_saved_files()
+ {
++    try { echo_integration::shortcut_context(); } catch (...) {
++        auto f=echo_integration::observation("ECHO.COLLECTOR.ERROR","coverage","collector","detections/saved_files/c_saved_files.cpp",0,"collector","Collection failed; not a detection.");
++        echo_integration::submit(std::move(f));
++    }
+     try {
+         CoInitialize(nullptr);
+ 
+--- a/detections/services/c_service_detection.cpp
++++ b/detections/services/c_service_detection.cpp
+@@ -1,4 +1,5 @@
+ #include "c_service_detection.h"
++#include "../echo_integration/native_artifacts.h"
+ 
+ std::wstring string_to_wstring(const std::string& str)
+ {
+@@ -182,6 +183,10 @@
+ 
+ void c_service_detection::start_service_checks()
+ {
++    try { echo_integration::driver_context(); } catch (...) {
++        auto f=echo_integration::observation("ECHO.COLLECTOR.ERROR","coverage","collector","detections/services/c_service_detection.cpp",0,"collector","Collection failed; not a detection.");
++        echo_integration::submit(std::move(f));
++    }
+     try{
+     try {
+         SYSTEMTIME st;
+--- a/detections/usnjournal/c_usnjournal.cpp
++++ b/detections/usnjournal/c_usnjournal.cpp
+@@ -1,4 +1,5 @@
+ #include "c_usnjournal.h"
++#include "../echo_integration/windows_support.h"
+ 
+ std::vector<usn_scan::custom_check> usn_scan::custom_checks = {
+ #ifdef DETECT_FIVEM
+@@ -647,7 +648,7 @@
+ 
+ };
+ 
+-std::unordered_map<ULONGLONG, std::wstring> usn_scan::file_reference_cache;
++std::unordered_map<std::string, std::wstring> usn_scan::file_reference_cache;
+ std::mutex usn_scan::file_reference_cache_mtx;
+ 
+ std::string usn_scan::convert_wstring_to_string(const std::wstring& wstr) {
+@@ -686,9 +687,10 @@
+ 
+ std::wstring usn_scan::resolve_parent_directory(HANDLE volume_handle, ULONGLONG file_reference) {
+     try {
++        const auto cache_key=std::to_string(reinterpret_cast<std::uintptr_t>(volume_handle))+":"+std::to_string(file_reference);
+         {
+             std::lock_guard<std::mutex> lk(file_reference_cache_mtx);
+-            auto cache_it = file_reference_cache.find(file_reference);
++            auto cache_it = file_reference_cache.find(cache_key);
+             if (cache_it != file_reference_cache.end())
+                 return cache_it->second;
+         }
+@@ -699,19 +701,19 @@
+         fid.FileId.QuadPart = static_cast<LONGLONG>(file_reference);
+ 
+         HANDLE fh = OpenFileById(volume_handle, &fid, 0,
+-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, 0);
++            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, FILE_FLAG_BACKUP_SEMANTICS);
+         if (fh == INVALID_HANDLE_VALUE) {
+             std::lock_guard<std::mutex> lk(file_reference_cache_mtx);
+-            file_reference_cache[file_reference] = std::wstring{};
++            file_reference_cache[cache_key] = std::wstring{};
+             return L"";
+         }
+ 
+         WCHAR buf[MAX_PATH];
+         DWORD r = GetFinalPathNameByHandleW(fh, buf, MAX_PATH, FILE_NAME_NORMALIZED);
+         CloseHandle(fh);
+-        if (r == 0) {
++        if (r == 0 || r >= MAX_PATH) {
+             std::lock_guard<std::mutex> lk(file_reference_cache_mtx);
+-            file_reference_cache[file_reference] = std::wstring{};
++            file_reference_cache[cache_key] = std::wstring{};
+             return L"";
+         }
+ 
+@@ -725,7 +727,7 @@
+             path += L'\\';
+ 
+         std::lock_guard<std::mutex> lk(file_reference_cache_mtx);
+-        file_reference_cache[file_reference] = path;
++        file_reference_cache[cache_key] = path;
+         return path;
+     }
+     catch (...) { return L""; }
+@@ -820,8 +822,14 @@
+         rd.UsnJournalID = jd.UsnJournalID;
+ 
+         std::vector<BYTE> buffer(65536);
++        echo_integration::UsnActivity echo_activity;
++        echo_integration::Budget echo_budget;
++        const auto echo_now = static_cast<std::int64_t>(std::time(nullptr));
++        // Bound the existing traversal too; record that coverage was incomplete.
++        bool echo_limited = false;
+ 
+         while (true) {
++            if (!echo_budget.take()) { echo_limited = true; break; }
+             DWORD bytes_read = 0;
+             if (!DeviceIoControl(vh, FSCTL_READ_USN_JOURNAL,
+                 &rd, sizeof(rd),
+@@ -836,8 +844,24 @@
+             const BYTE* end = buffer.data() + bytes_read;
+ 
+             while (ptr < end) {
++                if (static_cast<size_t>(end-ptr) < 8) break;
+                 const USN_RECORD* rec = reinterpret_cast<const USN_RECORD*>(ptr);
+-                if (rec->RecordLength == 0) break;
++                if (rec->RecordLength < 8 || rec->RecordLength > static_cast<size_t>(end-ptr)) break;
++                if (rec->MajorVersion != 2) { ptr += rec->RecordLength; continue; }
++                if (rec->RecordLength < offsetof(USN_RECORD, FileName) ||
++                    rec->FileNameOffset < offsetof(USN_RECORD, FileName) ||
++                    rec->FileNameOffset > rec->RecordLength || rec->FileNameLength % sizeof(WCHAR) ||
++                    rec->FileNameLength > rec->RecordLength - rec->FileNameOffset) break;
++                if (!echo_budget.take()) { echo_limited = true; break; }
++                const std::wstring echo_name(reinterpret_cast<const wchar_t*>(ptr+rec->FileNameOffset),rec->FileNameLength/sizeof(WCHAR));
++                const auto echo_ts=echo_integration::epoch(rec->TimeStamp.QuadPart);
++                if (echo_ts>0 && echo_ts<=echo_now && echo_now-echo_ts<=echo_integration::policy.window_seconds && (rec->Reason&0x80008007u)) {
++                    auto parent=resolve_parent_directory(vh,rec->ParentFileReferenceNumber);
++                    if (!parent.empty() && parent.back()!=L'\\') parent+=L'\\';
++                    // Unresolvable paths retain a volume/file-reference identity, not just a basename.
++                    auto identity=parent.empty()?drive_letter+":frn:"+std::to_string(rec->FileReferenceNumber)+":"+echo_integration::utf8(echo_name):echo_integration::utf8(parent+echo_name);
++                    echo_activity.add(drive_letter+":"+std::to_string(rec->FileReferenceNumber),identity,echo_ts,rec->Reason,echo_now);
++                }
+ 
+                 const DWORD rmask = rec->Reason;
+                 bool maybe_match = false;
+@@ -896,16 +920,22 @@
+                 ptr += rec->RecordLength;
+             }
+ 
+-            rd.StartUsn = *reinterpret_cast<const USN*>(buffer.data());
++            if (echo_limited) break;
++            USN next = 0; std::memcpy(&next, buffer.data(), sizeof(next));
++            if (next <= rd.StartUsn || next >= jd.NextUsn) break;
++            rd.StartUsn = next;
+         }
+ 
+         CloseHandle(vh);
++        echo_activity.finish();
++        if (echo_limited) echo_integration::coverage("usn", drive_letter.c_str(), {0,0,true});
+     }
+     catch (...) {}
+ }
+ 
+ void usn_scan::start_usn_scan() {
+     try {
++        { std::lock_guard<std::mutex> lock(file_reference_cache_mtx); file_reference_cache.clear(); }
+         DWORD drives = GetLogicalDrives();
+         if (!drives) return;
+ 
+--- a/detections/usnjournal/c_usnjournal.h
++++ b/detections/usnjournal/c_usnjournal.h
+@@ -17,7 +17,7 @@
+     };
+ 
+     static std::vector<custom_check> custom_checks;
+-    static std::unordered_map<ULONGLONG, std::wstring> file_reference_cache;
++    static std::unordered_map<std::string, std::wstring> file_reference_cache;
+     static std::mutex file_reference_cache_mtx;
+     static void start_usn_scan();
+ 
+--- a/detections/windows_defender/c_defender_history.cpp
++++ b/detections/windows_defender/c_defender_history.cpp
+@@ -1,4 +1,5 @@
+ #include "c_defender_history.h"
++#include "../echo_integration/windows_support.h"
+ 
+ std::wstring DefenderHistory::SanitizeString(const std::wstring& input) {
+     try{
+@@ -32,6 +33,10 @@
+ }
+ 
+ void DefenderHistory::QueryDefenderHistory() {
++    try { echo_integration::defender_context(); } catch (...) {
++        auto f=echo_integration::observation("ECHO.COLLECTOR.ERROR","coverage","collector","detections/windows_defender/c_defender_history.cpp",0,"collector","Collection failed; not a detection.");
++        echo_integration::submit(std::move(f));
++    }
+     try{
+     EVT_HANDLE hResults = EvtQuery(NULL, xorstr_(L"Microsoft-Windows-Windows Defender/Operational"),
+         xorstr_(L"*"), EvtQueryChannelPath);
