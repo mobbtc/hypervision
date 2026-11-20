@@ -55,7 +55,7 @@ inline std::string results_json() {
 }
 inline bool write_local_results() {
     const auto local=env(L"LOCALAPPDATA"); if(local.empty()) return false;
-    const auto dir=std::filesystem::path(local)/L"dettect"/L"echo-integration";
+    const auto dir=std::filesystem::path(local)/L"Hypervision"/L"reports";
     std::error_code ec;std::filesystem::create_directories(dir,ec);if(ec)return false;
     std::ofstream out(dir/L"latest.json",std::ios::binary|std::ios::trunc);
     out<<results_json();out.flush();return out.good();
