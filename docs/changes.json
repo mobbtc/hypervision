@@ -1,0 +1,77 @@
+{
+  "status": "experimental_source_integration_not_full_application",
+  "date": "2026-11-20",
+  "base_zip_sha256": "034934ce179ca49ae6bbf96906b9a04a7c48ab84b915f13671b29d3b39d18417",
+  "changed": [
+    {
+      "path": "atlas_trace/atlas/check_memory.cpp",
+      "original_sha256": "b1c11c71b191fc18d8b373271d8ba263705884b49d96796c39fb1b6013efc41b",
+      "new_sha256": "74e31b968d7f8ff9ea0e2178404fb11a462f77a552ce2a7a12076818289814ed"
+    },
+    {
+      "path": "client_checks/yara_scanner/c_yara_scanner.cpp",
+      "original_sha256": "f729d4dc6a46f37ba51da219f0d819a68b71db3a9ae94007afc6f941c1de1d0a",
+      "new_sha256": "36ed5d321367286c0980e22430b06295bdeb763a3a501ea0f665da1d814dc345"
+    },
+    {
+      "path": "detection_root.cpp",
+      "original_sha256": "53e141de23e7eab1aec9f0bc1d503302b64e65a63842e0ae341f6022c2424199",
+      "new_sha256": "60485d21349b6953f3a83c7ce603135f83f3d27fb14e8b2e5ec1859b970edc82"
+    },
+    {
+      "path": "efi_detections/c_efi_measured_boot.cpp",
+      "original_sha256": "4a752b7a2acab8314dc769cde62967835c368428f07fa78a8134e36efdce7a6f",
+      "new_sha256": "09ed653827c924b3c3b1550132dcbefe64f837a8854107cdded1bdc31f3c13ad"
+    },
+    {
+      "path": "powershell_detections/powershell_commands_ran_detection/c_powershell_commands_ran_detection.cpp",
+      "original_sha256": "b949909df5fa1c11b5033c093db804a2e763f5b1761b55af2002a58004b6b963",
+      "new_sha256": "87f6a23303d9baff9fbda146546e3e2b92aeb2528dd680533cd54d94f80773e1"
+    },
+    {
+      "path": "saved_files/c_saved_files.cpp",
+      "original_sha256": "008d065fdc182db184dfadb3dd7b540c751faec2e5313dac1c01d4ddb9ca0f6f",
+      "new_sha256": "30642fdb936c58506875e7df2a943d51e5ba737224f5f7b06dcd40042a2e78f5"
+    },
+    {
+      "path": "services/c_service_detection.cpp",
+      "original_sha256": "e9a6f59eb64ba75e0e15448cfd10f0820bb960fe7e713b89352135c217dbde1d",
+      "new_sha256": "a673c9bafef993e318e655839c03c9669a4f79122a76af5c1f5061592fbef982"
+    },
+    {
+      "path": "usnjournal/c_usnjournal.cpp",
+      "original_sha256": "a257d491cf8ac9883400ff4b51f979c6c1009c30a28daf0708035f4b10bd524c",
+      "new_sha256": "cb89114e2fc27ca8afc14d631b1dce182d395f0ef756deba4154cc75b2c0063b"
+    },
+    {
+      "path": "usnjournal/c_usnjournal.h",
+      "original_sha256": "dacc8b2dd9a0d6d5df15d390b00a54f289759c34b4f7fe060ae5138c21394de7",
+      "new_sha256": "53d05735f5adcb3d6426e62375418d0dd83fd2a83ca4b2a3d387651b2128538a"
+    },
+    {
+      "path": "windows_defender/c_defender_history.cpp",
+      "original_sha256": "c73bf271bd5424096745e6f60397aeaeb23cc54f5885798779ed727e326fbf10",
+      "new_sha256": "a969fa277571076e5661c6fe94565bf3ad4af8d3b3ecc1ad2c2a2058c7b92729"
+    }
+  ],
+  "added": [
+    "echo_integration/core.h",
+    "echo_integration/echo_rules.yar",
+    "echo_integration/efi_context.h",
+    "echo_integration/native_artifacts.h",
+    "echo_integration/runtime.h",
+    "echo_integration/windows_support.h",
+    "echo_integration/yara_rules.h",
+    "tests/echo_tests.cpp",
+    "tests/run-tests.cmd",
+    "tests/test_yara.py"
+  ],
+  "validation": {
+    "cpp17_windows_headers_and_fixtures": "PASS",
+    "yara_tests": 6,
+    "scheduler_call_order_and_membership": 132,
+    "full_application_build": "NOT POSSIBLE: missing application dependencies",
+    "live_scanner_execution": "NOT RUN"
+  },
+  "layout": "Module directories at repository root; original hashes describe the integration before relocation."
+}
