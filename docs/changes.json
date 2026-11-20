@@ -62,7 +62,6 @@
     "echo_integration/runtime.h",
     "echo_integration/windows_support.h",
     "echo_integration/yara_rules.h",
-    "INTEGRACAO.txt",
     "tests/echo_tests.cpp",
     "tests/run-tests.cmd",
     "tests/test_yara.py"
